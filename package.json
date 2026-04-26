@@ -1,0 +1,14 @@
+{
+  "name": "crony",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Run cron-syntax jobs from a persistent Bun process using your normal shell environment",
+  "bin": {
+    "crony": "src/cli.mjs"
+  },
+  "scripts": {
+    "start": "bun src/index.mjs",
+    "start:verbose": "CRONY_LOG_LEVEL=debug bun src/index.mjs"
+  }
+}
