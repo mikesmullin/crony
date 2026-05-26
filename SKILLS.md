@@ -51,20 +51,20 @@ Typical output lines:
 ```text
 INFO Starting crony scheduler with config=/path/to/crontab.yaml
 INFO Loaded 2 job(s). Scheduler running.
-[weekly-summaries] start schedule=* * * * * at=... planned=...
-[weekly-summaries] end status=ok exit=0 signal=none duration=...
+[daily-report] start schedule=* * * * * at=... planned=...
+[daily-report] end status=ok exit=0 signal=none duration=...
 ```
 
 ### 3) Force-run one job and exit
 
 Input:
 ```bash
-crony run weekly-summaries
+crony run daily-report
 ```
 
 Input with explicit config:
 ```bash
-crony run -f ./crontab.yaml weekly-summaries
+crony run -f ./crontab.yaml daily-report
 ```
 
 Expected behavior:
@@ -74,9 +74,9 @@ Expected behavior:
 
 Typical output lines:
 ```text
-INFO Force-running job 'weekly-summaries' (schedule ignored)
-[weekly-summaries] start schedule=* * * * * at=... planned=...
-[weekly-summaries] end status=ok exit=0 signal=none duration=...
+INFO Force-running job 'daily-report' (schedule ignored)
+[daily-report] start schedule=* * * * * at=... planned=...
+[daily-report] end status=ok exit=0 signal=none duration=...
 ```
 
 ### 4) List jobs in config
@@ -101,10 +101,10 @@ Typical output shape:
 Crony Jobs from /path/to/crontab.yaml
 Found 2 jobs
 
-1. [weekly-summaries] * * * * *  bun
-   pwd: /Users/.../agents
-   args: weekly-summaries/agent.mjs
-   log: logs/weekly-summaries.log
+1. [daily-report] * * * * *  bun
+   pwd: /home/user/projects/my-app
+   args: scripts/daily-report.mjs
+   log: logs/daily-report.log
 ```
 
 ## Scheduler semantics
@@ -130,34 +130,118 @@ Found 2 jobs
 
 Top-level YAML object with `jobs` array.
 
-Example:
+### Core fields (all jobs)
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Unique job identifier |
+| `cmd` | yes | Executable to run |
+| `schedule` | if no `autostart` | 5-field cron string |
+| `autostart` | if no `schedule` | `true` to launch on crony startup |
+| `pwd` | no | Working directory (default: config file dir) |
+| `args` | no | Array of string arguments |
+| `env` | no | Key/value env overrides |
+| `log` | no | Log file path (relative to `pwd`); omit to stream to crony stdout |
+| `logrotate` | no | Truncate log at start if larger than this size (e.g. `1M`); requires `log` |
+
+### Process supervision fields (autostart jobs)
+
+| Field | Default | Description |
+|---|---|---|
+| `restart` | `never` | `never` / `on-failure` / `always` |
+| `restart_delay` | `5` | Seconds to wait before restarting |
+| `restart_max` | `0` | Max restart attempts; `0` = unlimited |
+| `after` | `[]` | Wait for listed job IDs to be `running` before starting |
+| `requires` | `[]` | Like `after`, but also stop if a dep stops |
+| `flap_window` | `60` | Rolling window (seconds) for flap detection |
+| `flap_limit` | `5` | Max restarts in `flap_window` before marking job `flapping` |
+
+### Health check fields
+
+```yaml
+healthcheck:
+  cmd: "curl -sf http://localhost:3000/health"  # required; exit 0 = healthy
+  interval: 30      # seconds between probes (default: 30)
+  timeout: 5        # seconds before probe is killed as failed (default: 5)
+  retries: 3        # consecutive failures before restart (default: 3)
+  start_period: 10  # grace period after launch before failures count (default: 10)
+```
+
+Example jobs:
 ```yaml
 jobs:
-  - id: weekly-summaries
+  # Scheduled job — existing behavior, backward compatible
+  - id: daily-report
     schedule: "* * * * *"
-    pwd: ~/Workspace/me/agents
+    pwd: ~/projects/my-app
     env:
       DEBUG: 1
       NODE_ENV: development
     cmd: bun
     args:
-      - weekly-summaries/agent.mjs
-    log: logs/weekly-summaries.log
+      - scripts/daily-report.mjs
+    log: logs/daily-report.log
     logrotate: 1M
 
-  - id: logged-hours
+  # Autostart daemon with restart-on-failure
+  - id: my-server
+    autostart: true
+    restart: on-failure
+    restart_delay: 5
+    cmd: bun
+    args: [server.mjs]
+    healthcheck:
+      cmd: "curl -sf http://localhost:3000/health"
+      interval: 15
+      retries: 3
+      start_period: 10
+    log: logs/server.log
+
+  # Autostart daemon that depends on my-server being up first
+  - id: my-worker
+    autostart: true
+    restart: on-failure
+    after: [my-server]
+    cmd: bun
+    args: [worker.mjs]
+    log: logs/worker.log
+
+  # Always-restart tunnel with flap protection
+  - id: my-tunnel
+    autostart: true
+    restart: always
+    restart_delay: 5
+    flap_window: 60
+    flap_limit: 5
+    pwd: ~/projects/my-tunnel
+    cmd: bun
+    args: [tunnel]
+    log: logs/my-tunnel.log
+
+  - id: daily-report
     schedule: "0 11 * * 1-5"
-    pwd: ~/Workspace/me/agent/
-    cmd: plugins/nex/cron/daily-report.sh
+    pwd: ~/projects/my-app
+    cmd: scripts/daily-report.sh
 ```
 
 Validation expectations:
-- `id`, `schedule`, `cmd` are required non-empty strings
+- `id` and `cmd` are required non-empty strings
+- `schedule` or `autostart: true` must be present (or both)
 - `env` must be an object when present; values must be string/number/boolean
 - `args` must be an array of strings when present
 - `logrotate` can be number of bytes or size string (`K`, `M`, `G`) and requires `log`
 - `jobs` must be non-empty
 - duplicate `id` values are rejected
+- `after`/`requires` references must be valid job IDs; circular deps are rejected
+
+## PID files
+
+crony writes a PID file to `./pid/<job-id>.pid` (relative to the working directory where `crony run` is invoked, same as `crontab.yaml`) for every job while it is running.
+
+- Written atomically (temp file → rename) immediately after the child process is spawned
+- Removed when the process exits (clean exit, crash, or SIGTERM)
+- At startup, crony scans for leftover PID files from a previous session and removes them, logging a warning for each stale entry found
+- The `pid/` directory is created automatically; it is gitignored by default
 
 ## Agent usage tips
 
@@ -167,3 +251,6 @@ Validation expectations:
 - For shell features (pipes/redirection), set:
   - `cmd: zsh`
   - `args: ["-lc", "<command string>"]`
+- Autostart jobs with `restart: always` will restart even on clean exit 0 — use `on-failure` for jobs that should stop normally.
+- `flap_limit: 0` disables flap protection entirely (not recommended for daemons).
+

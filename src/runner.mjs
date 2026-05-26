@@ -2,6 +2,8 @@ import { mkdir, stat, truncate } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { spawn } from "node:child_process";
+import { HealthChecker } from "./health.mjs";
+import { writePidFile, removePidFile } from "./pidfile.mjs";
 
 function formatDuration(ms) {
   const s = Math.floor(ms / 1000);
@@ -33,22 +35,171 @@ function relayStreamToConsole(stream, onLine) {
 }
 
 export class Runner {
-  constructor({ logger }) {
+  constructor({ logger, pidDir = null }) {
     this.logger = logger;
+    this.pidDir = pidDir;
     this.active = new Map();
     this.shuttingDown = false;
     this.allowOverlap = false;
+    // Process supervision state
+    this.jobStatus = new Map();    // jobId -> 'idle'|'running'|'stopped'|'flapping'
+    this.restartData = new Map();  // jobId -> { count, timestamps[] }
+    this._statusListeners = [];
+    this._sleepTimers = new Set();
   }
 
   setShuttingDown(value) {
     this.shuttingDown = value;
+    if (value) {
+      // Wake all supervise loops that are sleeping between restarts
+      for (const timer of this._sleepTimers) {
+        clearTimeout(timer);
+      }
+      this._sleepTimers.clear();
+    }
   }
 
-  activeCount() {
-    return this.active.size;
+  activeCount(filter = null) {
+    if (!filter) return this.active.size;
+    let n = 0;
+    for (const { job } of this.active.values()) {
+      if (filter(job)) n++;
+    }
+    return n;
   }
 
-  async run(job, scheduledFor) {
+  getStatus(jobId) {
+    return this.jobStatus.get(jobId) || "idle";
+  }
+
+  onStatusChange(cb) {
+    this._statusListeners.push(cb);
+  }
+
+  _setStatus(jobId, status) {
+    this.jobStatus.set(jobId, status);
+    for (const cb of this._statusListeners) {
+      try { cb(jobId, status); } catch (_) {}
+    }
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this._sleepTimers.delete(timer);
+        resolve();
+      }, ms);
+      this._sleepTimers.add(timer);
+    });
+  }
+
+  // Wait until all dep jobs are running; returns false if a dep fails or we're shutting down
+  async _waitForDeps(job) {
+    const deps = [...(job.after || []), ...(job.requires || [])];
+    if (deps.length === 0) return true;
+
+    const pending = new Set(deps);
+    while (!this.shuttingDown && pending.size > 0) {
+      for (const depId of [...pending]) {
+        const s = this.jobStatus.get(depId);
+        if (s === "running") {
+          pending.delete(depId);
+        } else if (s === "stopped" || s === "flapping") {
+          this.logger.warn(`[${job.id}] dependency '${depId}' is ${s}; aborting start`);
+          return false;
+        }
+      }
+      if (pending.size > 0) {
+        await this._sleep(250);
+      }
+    }
+    return !this.shuttingDown;
+  }
+
+  // Manage full lifecycle of an autostart/supervised job (loops until shutdown or policy exhausted)
+  async supervise(job) {
+    this._setStatus(job.id, "idle");
+    this.restartData.set(job.id, { count: 0, timestamps: [] });
+
+    while (!this.shuttingDown) {
+      const depsReady = await this._waitForDeps(job);
+      if (!depsReady || this.shuttingDown) break;
+
+      this._setStatus(job.id, "running");
+
+      let healthChecker = null;
+      if (job.healthcheck) {
+        healthChecker = new HealthChecker({
+          job,
+          logger: this.logger,
+          onUnhealthy: () => {
+            const entry = this.active.get(job.id);
+            if (entry) {
+              try { entry.child.kill("SIGTERM"); } catch (_) {}
+            }
+          },
+        });
+      }
+
+      const result = await this.run(job, new Date(), {
+        onSpawned: healthChecker ? () => healthChecker.start() : null,
+      });
+
+      if (healthChecker) {
+        healthChecker.stop();
+      }
+
+      this._setStatus(job.id, "stopped");
+
+      if (this.shuttingDown || result.skipped) break;
+
+      // Check restart policy
+      const { restart } = job;
+      if (restart === "never") break;
+      if (restart === "on-failure" && (result.exitCode ?? 0) === 0) break;
+
+      // If a requires dep has stopped, don't restart
+      const goneRequires = (job.requires || []).find((depId) => {
+        const s = this.jobStatus.get(depId);
+        return s === "stopped" || s === "flapping";
+      });
+      if (goneRequires) {
+        this.logger.warn(`[${job.id}] required dependency '${goneRequires}' is stopped; halting restarts`);
+        break;
+      }
+
+      // Flapping check: track restart timestamps in a rolling window
+      const rd = this.restartData.get(job.id);
+      const nowMs = Date.now();
+      const windowMs = job.flap_window * 1000;
+      rd.timestamps.push(nowMs);
+      rd.timestamps = rd.timestamps.filter((t) => nowMs - t < windowMs);
+
+      if (job.flap_limit > 0 && rd.timestamps.length > job.flap_limit) {
+        this.logger.warn(
+          `[${job.id}] flapping detected (${rd.timestamps.length} restarts in ${job.flap_window}s window); giving up`
+        );
+        this._setStatus(job.id, "flapping");
+        break;
+      }
+
+      // restart_max check (0 = unlimited)
+      rd.count++;
+      if (job.restart_max > 0 && rd.count > job.restart_max) {
+        this.logger.warn(`[${job.id}] reached restart_max=${job.restart_max}; giving up`);
+        break;
+      }
+
+      this.logger.info(`[${job.id}] restarting in ${job.restart_delay}s (attempt=${rd.count})`);
+      await this._sleep(job.restart_delay * 1000);
+    }
+
+    if (this.jobStatus.get(job.id) !== "flapping") {
+      this._setStatus(job.id, "stopped");
+    }
+  }
+
+  async run(job, scheduledFor, { onSpawned } = {}) {
     if (this.shuttingDown) {
       this.logger.jobLine(job.id, "Skipping trigger while shutting down.");
       return { skipped: true };
@@ -60,7 +211,7 @@ export class Runner {
     }
 
     const startedAt = Date.now();
-    this.logger.jobLine(job.id, `start schedule=${job.schedule} at=${new Date().toISOString()} planned=${scheduledFor.toISOString()}`);
+    this.logger.jobLine(job.id, `start schedule=${job.schedule ?? "none"} at=${new Date().toISOString()} planned=${scheduledFor.toISOString()}`);
 
     let outputStream = null;
     if (job.log) {
@@ -98,7 +249,17 @@ export class Runner {
       shell: false
     });
 
-    this.active.set(job.id, child);
+    this.active.set(job.id, { child, job });
+
+    if (this.pidDir && child.pid != null) {
+      writePidFile(this.pidDir, job.id, child.pid).catch((err) => {
+        this.logger.warn(`[${job.id}] failed to write pid file: ${err.message}`);
+      });
+    }
+
+    if (onSpawned) {
+      try { onSpawned(); } catch (_) {}
+    }
 
     if (outputStream) {
       child.stdout.pipe(outputStream, { end: false });
@@ -122,6 +283,10 @@ export class Runner {
 
         const durationMs = Date.now() - startedAt;
         this.active.delete(job.id);
+
+        if (this.pidDir) {
+          removePidFile(this.pidDir, job.id).catch(() => {});
+        }
 
         if (outputStream) {
           outputStream.write(`=== [${new Date().toISOString()}] ${job.id} END exit=${result.exitCode} signal=${result.signal || "none"} duration=${formatDuration(durationMs)} ===\n`);
@@ -155,8 +320,9 @@ export class Runner {
     }
   }
 
-  killAll(signal = "SIGTERM") {
-    for (const [id, child] of this.active.entries()) {
+  killAll(signal = "SIGTERM", filter = null) {
+    for (const [id, { child, job }] of this.active.entries()) {
+      if (filter && !filter(job)) continue;
       try {
         child.kill(signal);
         this.logger.warn(`[${id}] sent ${signal}`);

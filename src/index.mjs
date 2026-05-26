@@ -3,6 +3,7 @@ import { loadConfig } from "./config.mjs";
 import { Logger } from "./logger.mjs";
 import { Scheduler } from "./scheduler.mjs";
 import { Runner } from "./runner.mjs";
+import { cleanStalePidFiles } from "./pidfile.mjs";
 
 const logger = new Logger();
 
@@ -30,8 +31,18 @@ Options:
 
 Config Notes:
     - Config file must be YAML with top-level key: jobs
-    - Each job supports: id, schedule, pwd, env, cmd, args, log, logrotate
-    - schedule uses 5-field cron syntax: minute hour day month day-of-week
+    - Each job supports: id, schedule, autostart, pwd, env, cmd, args, log, logrotate,
+      restart, restart_delay, restart_max, after, requires, flap_window, flap_limit, healthcheck
+    - schedule uses 5-field cron syntax: minute hour day month day-of-week (optional if autostart)
+    - autostart: true  launches the job when crony starts; restart policy keeps it alive
+    - restart: never | on-failure | always  (default: never)
+    - restart_delay: seconds to wait before restarting (default: 5)
+    - restart_max: max restart attempts, 0 = unlimited (default: 0)
+    - after: [job-id, ...]  wait for listed jobs to be running before starting this one
+    - requires: [job-id, ...]  like after, but also stop if a dep stops
+    - flap_window / flap_limit: stop restarting if too many restarts in a time window
+    - healthcheck.cmd: shell probe; non-zero exit = unhealthy → process is restarted
+    - healthcheck.interval / timeout / retries / start_period control probe behavior
     - If log is omitted, job output is streamed to crony stdout
     - env adds/overrides child process environment variables
     - logrotate truncates a log file at start of run when size exceeds threshold (e.g. 1M)
@@ -83,6 +94,12 @@ Examples:
 `);
 }
 
+function jobModeLabel(job) {
+  if (job.autostart && job.schedule) return color("[autostart+scheduled]", 255, 200, 100);
+  if (job.autostart) return color("[autostart]", 120, 255, 160);
+  return color("[scheduled]", 120, 200, 255);
+}
+
 function printJobList(configPath, jobs) {
   const title = color("Crony Jobs", 120, 220, 255);
   const cfg = color(configPath, 186, 255, 201);
@@ -92,10 +109,11 @@ function printJobList(configPath, jobs) {
 
   jobs.forEach((job, index) => {
     const n = color(`${index + 1}.`, 155, 155, 155);
-    const schedule = color(job.schedule, 255, 190, 120);
+    const schedule = job.schedule ? color(job.schedule, 255, 190, 120) : color("(none)", 130, 130, 130);
     const cmd = color(job.cmd, 180, 235, 255);
     const log = job.log ? color(job.log, 180, 255, 220) : color("stdout", 190, 190, 190);
-    process.stdout.write(`${n} ${logger.jobPrefix(job.id)} ${schedule}  ${cmd}\n`);
+    const mode = jobModeLabel(job);
+    process.stdout.write(`${n} ${logger.jobPrefix(job.id)} ${mode} ${schedule}  ${cmd}\n`);
     process.stdout.write(`   ${color("pwd:", 140, 140, 140)} ${job.pwd}\n`);
     const envPreview = Object.keys(job.env || {}).length === 0
       ? "(inherits parent only)"
@@ -104,6 +122,17 @@ function printJobList(configPath, jobs) {
     process.stdout.write(`   ${color("args:", 140, 140, 140)} ${job.args.length > 0 ? job.args.join(" ") : "(none)"}\n`);
     process.stdout.write(`   ${color("log:", 140, 140, 140)} ${log}\n`);
     process.stdout.write(`   ${color("logrotate:", 140, 140, 140)} ${job.logrotate || "(off)"}\n`);
+    process.stdout.write(`   ${color("restart:", 140, 140, 140)} ${job.restart}${job.restart !== "never" ? color(` (delay=${job.restart_delay}s max=${job.restart_max === 0 ? "∞" : job.restart_max})`, 160, 160, 160) : ""}\n`);
+    if (job.after.length > 0) {
+      process.stdout.write(`   ${color("after:", 140, 140, 140)} ${job.after.join(", ")}\n`);
+    }
+    if (job.requires.length > 0) {
+      process.stdout.write(`   ${color("requires:", 140, 140, 140)} ${job.requires.join(", ")}\n`);
+    }
+    if (job.healthcheck) {
+      const hc = job.healthcheck;
+      process.stdout.write(`   ${color("healthcheck:", 140, 140, 140)} ${color(hc.cmd, 220, 220, 160)} ${color(`(every ${hc.interval}s, timeout ${hc.timeout}s, retries ${hc.retries}, grace ${hc.start_period}s)`, 150, 150, 150)}\n`);
+    }
   });
 }
 
@@ -142,13 +171,17 @@ function parseRunArgs(args) {
   return { help: false, configArg, jobId };
 }
 
-async function runDaemon(config, configPath) {
+async function runDaemon(config, configPath, projectDir) {
   logger.info(`Starting crony scheduler with config=${configPath}`);
 
-  const runner = new Runner({ logger });
+  const pidDir = resolve(projectDir, "pid");
+  await cleanStalePidFiles(pidDir, config.jobs, logger);
+
+  const runner = new Runner({ logger, pidDir });
   const scheduler = new Scheduler({
     jobs: config.jobs,
     logger,
+    onAutostart: (job) => runner.supervise(job),
     onTrigger: async (job, nextRun) => {
       try {
         await runner.run(job, nextRun);
@@ -167,13 +200,25 @@ async function runDaemon(config, configPath) {
       runner.setShuttingDown(true);
       scheduler.stop();
 
-      const active = runner.activeCount();
-      if (active === 0) {
+      const activeAutostart = runner.activeCount((job) => job.autostart);
+      const activeScheduled = runner.activeCount((job) => !job.autostart);
+
+      if (activeAutostart === 0 && activeScheduled === 0) {
         logger.info("Shutdown complete. No active jobs.");
         process.exit(0);
       }
 
-      logger.warn(`Graceful shutdown: waiting for ${active} active job(s). Press Ctrl+C again to force stop.`);
+      if (activeAutostart > 0) {
+        logger.warn(`Graceful shutdown: sending SIGTERM to ${activeAutostart} supervised job(s).`);
+        runner.killAll("SIGTERM", (job) => job.autostart);
+      }
+      if (activeScheduled > 0) {
+        logger.warn(`Graceful shutdown: waiting for ${activeScheduled} scheduled job(s) to finish.`);
+      }
+      if (activeAutostart > 0 || activeScheduled > 0) {
+        logger.warn("Press Ctrl+C again to force kill.");
+      }
+
       await runner.waitForIdle();
       logger.info("All active jobs completed. Exiting.");
       process.exit(0);
@@ -274,7 +319,7 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  await runDaemon(config, configPath);
+  await runDaemon(config, configPath, projectDir);
 }
 
 if (import.meta.main) {

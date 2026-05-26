@@ -81,9 +81,10 @@ function setLongTimeout(callback, delayMs) {
 }
 
 export class Scheduler {
-  constructor({ jobs, onTrigger, logger }) {
+  constructor({ jobs, onTrigger, onAutostart, logger }) {
     this.jobs = jobs;
     this.onTrigger = onTrigger;
+    this.onAutostart = onAutostart;
     this.logger = logger;
     this.stopped = false;
     this.pendingTimers = new Map();
@@ -93,6 +94,7 @@ export class Scheduler {
 
   verifySchedules() {
     for (const job of this.jobs) {
+      if (!job.schedule) continue;
       try {
         const compiled = compileCron(job.schedule);
         computeNextRun(compiled, new Date());
@@ -105,13 +107,26 @@ export class Scheduler {
 
   start() {
     this.verifySchedules();
-    this.logger.info(`Loaded ${this.jobs.length} job(s). Scheduler running.`);
+
+    const scheduledJobs = this.jobs.filter((j) => j.schedule);
+    const autostartJobs = this.jobs.filter((j) => j.autostart);
+    const total = this.jobs.length;
+
+    this.logger.info(`Loaded ${total} job(s). Scheduler running.`);
+
+    // Launch autostart jobs (supervised lifecycle managed by runner)
+    for (const job of autostartJobs) {
+      this.logger.info(`[${job.id}] autostart`);
+      void this.onAutostart(job);
+    }
+
+    if (scheduledJobs.length === 0) return;
 
     const now = new Date();
     const currentMinute = new Date(now.getTime());
     currentMinute.setSeconds(0, 0);
 
-    for (const job of this.jobs) {
+    for (const job of scheduledJobs) {
       const compiled = this.compiled.get(job.id);
       const immediate = cronMatches(compiled, now);
       const nextAt = immediate ? currentMinute : computeNextRun(compiled, now);
@@ -137,7 +152,7 @@ export class Scheduler {
   }
 
   scheduleNext(job, fromDate) {
-    if (this.stopped) {
+    if (this.stopped || !job.schedule) {
       return;
     }
 
